@@ -1,2 +1,5 @@
 [phases.setup]
 nixPkgs = ["git", "curl"]
+
+[phases.install]
+cmds = ["npm ci"]

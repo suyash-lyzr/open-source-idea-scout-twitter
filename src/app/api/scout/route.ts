@@ -1,247 +1,218 @@
 import { NextResponse } from "next/server";
+import { exec } from "child_process";
+import { readdir, readFile, writeFile, mkdir } from "fs/promises";
+import path from "path";
+import { promisify } from "util";
 
-export const maxDuration = 120;
+const execAsync = promisify(exec);
 
-const TWITTER_BEARER = process.env.TWITTER_BEARER_TOKEN || "";
-const TAVILY_KEY = process.env.TAVILY_API_KEY || "";
+export const maxDuration = 300;
 
-// In-memory session store (persists across requests while server is running)
-const sessionStore: Session[] = [];
+const AGENT_DIR = path.join(process.cwd(), "agent");
 
-// Minimum engagement to consider a tweet "viral"
-const MIN_LIKES = 5;
-const MIN_IMPRESSIONS = 500;
+// ── Types ───────────────────────────────────────────────────────
 
-// ── Twitter Search ──────────────────────────────────────────────
-
-interface Tweet {
-  id: string;
-  text: string;
-  author_id: string;
-  created_at: string;
-  public_metrics: {
-    retweet_count: number;
-    reply_count: number;
-    like_count: number;
-    quote_count: number;
-    bookmark_count: number;
-    impression_count: number;
-  };
-  category: string;
-  engagement: number;
-  link: string;
-}
-
-const SEARCHES = [
-  { query: '%22someone%20should%20build%22%20-is:retweet', category: 'Wishlist' },
-  { query: '%22I%20wish%20there%20was%22%20-is:retweet', category: 'Pain Point' },
-  { query: '%22open%20source%20alternative%22%20-is:retweet', category: 'OSS Demand' },
-  { query: '(%22just%20shipped%22%20OR%20%22just%20launched%22)%20(AI%20agent%20OR%20developer%20tool)%20-is:retweet', category: 'New Launch' },
-  { query: '(AI%20agent%20OR%20coding%20agent)%20(idea%20OR%20build%20OR%20need%20OR%20missing)%20-is:retweet', category: 'Agent Trend' },
-  { query: '(from:karpathy%20OR%20from:levelsio%20OR%20from:swyx)%20(agent%20OR%20AI%20OR%20build%20OR%20open%20source)%20-is:retweet', category: 'Influencer' },
-  { query: '%22why%20is%20there%20no%22%20(tool%20OR%20app%20OR%20agent)%20-is:retweet', category: 'Unmet Need' },
-  { query: '(%22so%20frustrating%22%20OR%20%22waste%20of%20time%22)%20(developer%20OR%20coding%20OR%20AI)%20-is:retweet', category: 'Frustration' },
-];
-
-async function searchTwitter(query: string, category: string): Promise<Tweet[]> {
-  try {
-    const url = `https://api.twitter.com/2/tweets/search/recent?query=${query}&max_results=10&tweet.fields=public_metrics,author_id,created_at`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${TWITTER_BEARER}` },
-    });
-    const data = await res.json();
-    if (!data.data) return [];
-
-    return data.data.map((t: Record<string, unknown>) => {
-      const metrics = t.public_metrics as Tweet["public_metrics"];
-      const engagement =
-        (metrics?.like_count || 0) * 3 +
-        (metrics?.retweet_count || 0) * 5 +
-        (metrics?.bookmark_count || 0) * 4 +
-        (metrics?.reply_count || 0) * 2 +
-        (metrics?.quote_count || 0) * 3;
-
-      return {
-        id: t.id,
-        text: t.text,
-        author_id: t.author_id,
-        created_at: t.created_at,
-        public_metrics: metrics,
-        category,
-        engagement,
-        link: `https://x.com/i/status/${t.id}`,
-      };
-    });
-  } catch {
-    return [];
-  }
-}
-
-// ── Tavily Search ───────────────────────────────────────────────
-
-interface TavilyResult {
-  url: string;
-  title: string;
-  content: string;
-  score: number;
-}
-
-async function tavilySearch(query: string): Promise<TavilyResult[]> {
-  try {
-    const res = await fetch("https://api.tavily.com/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: TAVILY_KEY,
-        query,
-        max_results: 3,
-        search_depth: "basic",
-      }),
-    });
-    const data = await res.json();
-    return data.results || [];
-  } catch {
-    return [];
-  }
-}
-
-// ── Idea Generation ─────────────────────────────────────────────
-
+interface Source { url: string; description: string }
 interface Idea {
-  name: string;
-  fileName: string;
-  pitch: string;
-  trend: string;
-  sources: { url: string; description: string }[];
-  gap: string;
-  agentDescription: string;
-  mvp: string[];
-  stack: string;
-  buildTime: string;
-  viralityScore: number;
-  whyGitClaw: string;
-  claudeMd: string;
+  name: string; fileName: string; pitch: string; trend: string;
+  sources: Source[]; gap: string; agentDescription: string;
+  mvp: string[]; stack: string; buildTime: string;
+  viralityScore: number; whyGitClaw: string; claudeMd: string;
   rawContent: string;
-  marketCheck: {
-    exists: boolean;
-    competitors: { name: string; url: string; snippet: string }[];
-    verdict: string;
-  };
+  marketCheck: { exists: boolean; competitors: { name: string; url: string; snippet: string }[]; verdict: string };
+}
+interface Session {
+  name: string; date: string; time: string; ideas: Idea[];
 }
 
-function groupTweetsByTheme(tweets: Tweet[]): Map<string, Tweet[]> {
-  const themes = new Map<string, Tweet[]>();
-  const keywords: Record<string, string[]> = {};
+// ── GET — return existing sessions ──────────────────────────────
 
-  for (const tweet of tweets) {
-    const text = tweet.text.toLowerCase();
-    // Extract 2-3 word phrases as rough theme keys
-    const words = text
-      .replace(/https?:\/\/\S+/g, "")
-      .replace(/[^a-z0-9\s]/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length > 3 && !["should", "build", "there", "would", "could", "someone", "really", "about", "their", "these", "those", "with", "from", "have", "this", "that", "just", "more", "been", "what", "when", "will", "like", "than", "into", "also", "very"].includes(w));
+export async function GET() {
+  try {
+    const sessions = await loadSessions();
+    return NextResponse.json({ sessions });
+  } catch {
+    return NextResponse.json({ sessions: [] });
+  }
+}
 
-    // Use category + top keywords as grouping key
-    const key = `${tweet.category}:${words.slice(0, 3).join("+")}`;
+// ── POST — run gitclaw scout ────────────────────────────────────
 
-    // Find similar existing theme or create new
-    let matched = false;
-    for (const [existingKey, existingTweets] of themes) {
-      const existingWords = keywords[existingKey] || [];
-      const overlap = words.filter((w) => existingWords.includes(w));
-      if (overlap.length >= 2 || existingKey.split(":")[0] === tweet.category && overlap.length >= 1) {
-        existingTweets.push(tweet);
-        keywords[existingKey] = [...new Set([...existingWords, ...words])];
-        matched = true;
-        break;
+export async function POST() {
+  try {
+    const gitclawPath = await findGitclaw();
+
+    // Ensure agent/.env exists with current env vars (Railway sets them in dashboard)
+    await ensureAgentEnv();
+
+    // Ensure ideas/ dir exists
+    await mkdir(path.join(AGENT_DIR, "ideas"), { recursive: true });
+    await mkdir(path.join(AGENT_DIR, "scouted"), { recursive: true });
+
+    await execAsync(
+      `${gitclawPath} --dir "${AGENT_DIR}" "Run the scout skill. Deep-scan Twitter/X right now — run all 8 searches. Find the top 3 open-source GitClaw agent ideas based on what people are tweeting about. Include tweet links and engagement metrics for every idea. Follow the SOUL.md output format exactly. Save results to the ideas/ folder."`,
+      {
+        timeout: 280000,
+        maxBuffer: 1024 * 1024 * 10,
+        env: {
+          ...process.env,
+          HOME: process.env.HOME || "/root",
+          PATH: `${process.env.HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`,
+        },
+        cwd: AGENT_DIR,
       }
+    );
+
+    const sessions = await loadSessions();
+    return NextResponse.json({
+      ideas: sessions[0]?.ideas || [],
+      session: sessions[0]?.name || "live",
+      sessions,
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("Scout error:", message);
+    return NextResponse.json({ error: `Scout failed: ${message}` }, { status: 500 });
+  }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────
+
+async function ensureAgentEnv() {
+  const envVars = [
+    "ANTHROPIC_API_KEY",
+    "TWITTER_BEARER_TOKEN",
+    "TAVILY_API_KEY",
+    "COMPOSIO_API_KEY",
+    "COMPOSIO_USER_ID",
+    "OPENAI_API_KEY",
+  ];
+  const envContent = envVars
+    .filter((key) => process.env[key])
+    .map((key) => `${key}=${process.env[key]}`)
+    .join("\n");
+
+  if (envContent) {
+    await writeFile(path.join(AGENT_DIR, ".env"), envContent + "\n", "utf-8");
+  }
+}
+
+async function findGitclaw(): Promise<string> {
+  const candidates = [
+    path.join(process.cwd(), "node_modules", ".bin", "gitclaw"),
+    `${process.env.HOME}/.npm-global/bin/gitclaw`,
+    "/usr/local/bin/gitclaw",
+    "gitclaw",
+  ];
+  for (const c of candidates) {
+    try {
+      await execAsync(`test -x "${c}" || which "${c}" 2>/dev/null`);
+      return c;
+    } catch { /* try next */ }
+  }
+  return candidates[0]; // fallback to node_modules
+}
+
+async function loadSessions(): Promise<Session[]> {
+  const sessions: Session[] = [];
+  try {
+    const ideasDir = path.join(AGENT_DIR, "ideas");
+    const entries = await readdir(ideasDir, { withFileTypes: true });
+    const sessionDirs = entries
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort()
+      .reverse();
+
+    for (const dirName of sessionDirs) {
+      const sessionPath = path.join(ideasDir, dirName);
+      const files = await readdir(sessionPath);
+      const ideaFiles = files.filter(
+        (f) => f.endsWith(".md") && f !== "index.md" && !f.includes("research") && !f.includes("trends")
+      );
+
+      const ideas: Idea[] = await Promise.all(
+        ideaFiles.map(async (file) => {
+          const content = await readFile(path.join(sessionPath, file), "utf-8");
+          return parseIdeaFile(content, file);
+        })
+      );
+
+      ideas.sort((a, b) => b.viralityScore - a.viralityScore);
+
+      const parts = dirName.split("_");
+      sessions.push({
+        name: dirName,
+        date: parts[0] || dirName,
+        time: parts[1]?.replace("-", ":") || "",
+        ideas,
+      });
     }
-    if (!matched) {
-      themes.set(key, [tweet]);
-      keywords[key] = words;
+  } catch {
+    // ideas/ dir may not exist yet
+  }
+  return sessions;
+}
+
+function parseIdeaFile(content: string, fileName: string): Idea {
+  const lines = content.split("\n");
+  const name = (lines[0] || "").replace(/^#\s+/, "").replace(/\s*—.*$/, "").trim() || fileName.replace(".md", "");
+
+  const getSection = (heading: string): string => {
+    const regex = new RegExp(`##\\s+${heading}`, "i");
+    const startIdx = lines.findIndex((l) => regex.test(l));
+    if (startIdx === -1) return "";
+    const endIdx = lines.findIndex((l, i) => i > startIdx && /^##\s/.test(l));
+    return lines.slice(startIdx + 1, endIdx === -1 ? undefined : endIdx).join("\n").trim();
+  };
+
+  const trendSection = getSection("What.s trending") || getSection("The Trend") || "";
+  const gapSection = getSection("The Gap") || getSection("The gap") || "";
+  const agentSection = getSection("The GitClaw Agent") || getSection("The agent") || "";
+  const mvpSection = getSection("MVP") || "";
+  const whyGitClaw = getSection("Why it.ll get stars") || getSection("Why") || "";
+
+  // Extract sources (tweet links)
+  const sources: Source[] = [];
+  const urlRegex = /[-*]\s*(https?:\/\/\S+)\s*[—-]\s*(.*)/g;
+  let match;
+  while ((match = urlRegex.exec(content)) !== null) {
+    sources.push({ url: match[1], description: match[2].trim() });
+  }
+  if (sources.length === 0) {
+    const tweetRegex = /(https:\/\/x\.com\/i\/status\/\d+)/g;
+    let tweetMatch;
+    while ((tweetMatch = tweetRegex.exec(content)) !== null) {
+      const idx = content.indexOf(tweetMatch[1]);
+      const lineStart = content.lastIndexOf("\n", idx) + 1;
+      const lineEnd = content.indexOf("\n", idx);
+      const line = content.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).replace(tweetMatch[1], "").replace(/^[-*\s]+/, "").trim();
+      sources.push({ url: tweetMatch[1], description: line || "Tweet source" });
     }
   }
 
-  return themes;
-}
+  const mvpItems: string[] = [];
+  for (const line of mvpSection.split("\n")) {
+    const item = line.replace(/^[-*\s\[\]x]+/, "").trim();
+    if (item && !item.startsWith("#")) mvpItems.push(item);
+  }
 
-function generateIdeaFromTweets(tweets: Tweet[], rank: number): Omit<Idea, "marketCheck"> {
-  // Sort by engagement within the group
-  tweets.sort((a, b) => b.engagement - a.engagement);
-  const topTweet = tweets[0];
-  const totalEngagement = tweets.reduce((s, t) => s + t.engagement, 0);
-  const avgLikes = Math.round(tweets.reduce((s, t) => s + (t.public_metrics?.like_count || 0), 0) / tweets.length);
+  let viralityScore = 3;
+  const numbers = content.match(/(\d{1,3}(?:,\d{3})*)\s*(?:stars?|points?|pts|likes?|impressions?|bookmarks?)/gi) || [];
+  const maxEngagement = Math.max(...numbers.map((n) => parseInt(n.replace(/[^\d]/g, "")) || 0), 0);
+  if (maxEngagement > 10000) viralityScore = 5;
+  else if (maxEngagement > 1000) viralityScore = 4;
+  else if (maxEngagement > 500) viralityScore = 4;
+  else if (maxEngagement > 100) viralityScore = 3;
 
-  // Extract a rough idea name from the most engaging tweet
-  const cleanText = topTweet.text
-    .replace(/https?:\/\/\S+/g, "")
-    .replace(/@\w+/g, "")
-    .replace(/\n/g, " ")
-    .trim();
+  const agentFirstPara = agentSection.split("\n").filter((l) => l.trim() && !l.startsWith("#")).slice(0, 2).join(" ").replace(/\*\*(.*?)\*\*/g, "$1").replace(/`(.*?)`/g, "$1").trim();
+  const gapFirstPara = gapSection.split("\n").filter((l) => l.trim() && !l.match(/^\d+\./)).slice(0, 2).join(" ").replace(/\*\*(.*?)\*\*/g, "$1").replace(/`(.*?)`/g, "$1").trim();
+  const pitch = agentFirstPara || gapFirstPara || name;
 
-  // Generate a name from keywords
-  const significantWords = cleanText
-    .replace(/[^a-zA-Z0-9\s]/g, "")
-    .split(/\s+/)
-    .filter((w) => w.length > 3)
-    .slice(0, 3);
+  const stackMatch = content.match(/\*\*Stack:?\*\*\s*(.*)/i) || content.match(/##\s+Stack\s*\n(.*)/i);
+  const stack = stackMatch ? stackMatch[1].trim() : "GitAgent spec + Claude Sonnet 4.6 + Composio";
 
-  const name = significantWords.length > 0
-    ? significantWords.map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join("") + " Agent"
-    : `Idea${rank} Agent`;
-
-  const fileName = name.toLowerCase().replace(/\s+/g, "-") + ".md";
-
-  // Virality score based on engagement
-  let viralityScore = 2;
-  if (totalEngagement > 500) viralityScore = 5;
-  else if (totalEngagement > 200) viralityScore = 4;
-  else if (totalEngagement > 50) viralityScore = 3;
-
-  const sources = tweets.slice(0, 3).map((t) => {
-    const metrics = t.public_metrics;
-    const engagement = `${metrics?.like_count || 0} likes, ${metrics?.bookmark_count || 0} bookmarks, ${metrics?.impression_count || 0} impressions`;
-    return {
-      url: t.link,
-      description: `${t.text.slice(0, 200).replace(/\n/g, " ")} (${engagement})`,
-    };
-  });
-
-  const gap = `People on Twitter are actively asking for this (${tweets.length} related tweets found, avg ${avgLikes} likes). The tweets in the "${topTweet.category}" category show clear demand for a tool that addresses: ${cleanText.slice(0, 200)}.`;
-
-  const pitch = cleanText.slice(0, 300);
-
-  const mvp = [
-    `SOUL.md defining the agent's purpose based on the Twitter demand signal`,
-    `Core skill that addresses the main pain point from these tweets`,
-    `Memory system to track and learn from usage patterns`,
-    `Composio integration for relevant external services`,
-    `CLI-runnable via gitclaw --dir . "prompt"`,
-  ];
-
-  const claudeMd = generateClaudeMd(name, pitch, gap, mvp);
-
-  return {
-    name,
-    fileName,
-    pitch,
-    trend: `${tweets.length} tweets found in "${topTweet.category}" category with total weighted engagement of ${totalEngagement}. Top tweet has ${topTweet.public_metrics?.like_count || 0} likes and ${topTweet.public_metrics?.impression_count || 0} impressions.`,
-    sources,
-    gap,
-    agentDescription: `A GitClaw agent that addresses the demand signal from ${tweets.length} viral tweets about ${significantWords.join(" ").toLowerCase()}.`,
-    mvp,
-    stack: "GitAgent spec + Claude Sonnet 4.6 + Composio",
-    buildTime: "1-2 weeks",
-    viralityScore,
-    whyGitClaw: `${tweets.length} tweets validate demand. Average ${avgLikes} likes per tweet. Open-source GitClaw agent = first to market with a portable, agent-native solution.`,
-    claudeMd,
-    rawContent: tweets.map((t) => `[${t.category}] ${t.text} (${t.link})`).join("\n\n"),
-  };
-}
-
-function generateClaudeMd(name: string, pitch: string, gap: string, mvp: string[]): string {
-  return `# ${name}
+  const claudeMd = `# ${name}
 
 ## Identity
 You are building "${name}" — a GitClaw/GitAgent-based open-source agent.
@@ -250,10 +221,9 @@ You are building "${name}" — a GitClaw/GitAgent-based open-source agent.
 ${pitch}
 
 ## Problem it solves
-${gap}
+${gapSection}
 
 ## Architecture
-This is a GitAgent-spec agent:
 \`\`\`
 ${name.toLowerCase().replace(/\s+/g, "-")}/
   agent.yaml
@@ -265,7 +235,7 @@ ${name.toLowerCase().replace(/\s+/g, "-")}/
 \`\`\`
 
 ## MVP Scope
-${mvp.map((item) => `- ${item}`).join("\n")}
+${mvpItems.map((item) => `- ${item}`).join("\n")}
 
 ## How to build
 1. Create the folder structure above
@@ -273,89 +243,14 @@ ${mvp.map((item) => `- ${item}`).join("\n")}
 3. Write agent.yaml with model, tools, and skills
 4. Build each skill as a SKILL.md file
 5. Test with: \`gitclaw --dir . "test prompt"\`
-
-## Rules
-- Keep it buildable by one person in 1-2 weeks
-- Use GitAgent spec (SOUL.md + agent.yaml + skills/)
-- Make it portable (exportable to Claude Code, Cursor, etc.)
 `;
-}
 
-// ── API Routes ──────────────────────────────────────────────────
-
-interface Session {
-  name: string;
-  date: string;
-  time: string;
-  ideas: Idea[];
-}
-
-// GET — return existing sessions from in-memory store
-export async function GET() {
-  return NextResponse.json({ sessions: sessionStore });
-}
-
-// POST — run a new scout
-export async function POST() {
-  try {
-    // Step 1: Run all 8 Twitter searches in parallel
-    const allResults = await Promise.all(
-      SEARCHES.map((s) => searchTwitter(s.query, s.category))
-    );
-
-    const allTweets = allResults
-      .flat()
-      .filter((t) => {
-        const m = t.public_metrics;
-        return (m?.like_count || 0) >= MIN_LIKES || (m?.impression_count || 0) >= MIN_IMPRESSIONS;
-      })
-      .filter((t, i, arr) => arr.findIndex((x) => x.id === t.id) === i)
-      .sort((a, b) => b.engagement - a.engagement);
-
-    // Step 2: Group tweets into themes and pick top 3
-    const themes = groupTweetsByTheme(allTweets);
-    const sortedThemes = [...themes.entries()]
-      .map(([key, tweets]) => ({
-        key,
-        tweets,
-        totalEngagement: tweets.reduce((s, t) => s + t.engagement, 0),
-      }))
-      .sort((a, b) => b.totalEngagement - a.totalEngagement)
-      .slice(0, 3);
-
-    // Step 3: Generate ideas from top themes
-    const rawIdeas = sortedThemes.map((theme, i) =>
-      generateIdeaFromTweets(theme.tweets, i + 1)
-    );
-
-    const ideas: Idea[] = rawIdeas.map((idea) => ({
-      ...idea,
-      marketCheck: { exists: false, competitors: [], verdict: "" },
-    }));
-
-    // Sort by virality
-    ideas.sort((a, b) => b.viralityScore - a.viralityScore);
-
-    // Save to in-memory store
-    const now = new Date();
-    const session: Session = {
-      name: `${now.toISOString().slice(0, 10)}_${now.toISOString().slice(11, 16).replace(":", "-")}`,
-      date: now.toISOString().slice(0, 10),
-      time: now.toISOString().slice(11, 16),
-      ideas,
-    };
-
-    // Keep max 10 sessions in memory
-    sessionStore.unshift(session);
-    if (sessionStore.length > 10) sessionStore.pop();
-
-    return NextResponse.json({
-      ideas,
-      session: session.name,
-      sessions: sessionStore,
-    });
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
+  return {
+    name, fileName, pitch,
+    trend: trendSection, sources, gap: gapSection,
+    agentDescription: agentSection, mvp: mvpItems,
+    stack, buildTime: "1-2 weeks", viralityScore, whyGitClaw,
+    claudeMd, rawContent: content,
+    marketCheck: { exists: false, competitors: [], verdict: "" },
+  };
 }

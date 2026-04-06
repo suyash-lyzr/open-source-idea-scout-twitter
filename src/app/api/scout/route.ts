@@ -44,13 +44,14 @@ export async function POST() {
       messages.push(msg);
     }
 
-    // Extract the final assistant response
-    const assistantMessages = messages
+    // Combine all assistant responses (ideas may span multiple messages)
+    const fullResponse = messages
       .filter((m): m is GCMessage & { type: "assistant" } => m.type === "assistant")
       .map((m) => m.content)
-      .filter(Boolean);
+      .filter(Boolean)
+      .join("\n\n");
 
-    const finalResponse = assistantMessages[assistantMessages.length - 1] || "";
+    const finalResponse = fullResponse;
 
     // Parse ideas from the response
     const ideas = parseIdeasFromResponse(finalResponse);
@@ -91,7 +92,19 @@ function parseIdeasFromResponse(response: string): Idea[] {
   // Split by "## Idea" headers
   const ideaBlocks = response.split(/##\s+Idea\s+\d+:\s*/i).filter((b) => b.trim());
 
-  for (const block of ideaBlocks.slice(0, 3)) {
+  // Filter out blocks that don't look like ideas (e.g. "All 8 searches done...")
+  const validBlocks = ideaBlocks.filter((b) => {
+    const firstLine = b.split("\n")[0]?.trim() || "";
+    // Skip meta-output lines
+    if (firstLine.toLowerCase().includes("searches done")) return false;
+    if (firstLine.toLowerCase().includes("ideas generated")) return false;
+    if (firstLine.toLowerCase().includes("here's the")) return false;
+    if (firstLine.toLowerCase().includes("full output")) return false;
+    // Must have some substance
+    return b.length > 100;
+  });
+
+  for (const block of validBlocks.slice(0, 3)) {
     const lines = block.split("\n");
     const name = lines[0]?.replace(/^#+\s*/, "").replace(/\s*—.*$/, "").trim() || "Unnamed Idea";
 
@@ -107,30 +120,65 @@ function parseIdeasFromResponse(response: string): Idea[] {
       if (startIdx === -1) return "";
       const endIdx = lines.findIndex((l, i) => i > startIdx && /^\*\*[A-Z]/.test(l));
       const section = lines.slice(startIdx + 1, endIdx === -1 ? undefined : endIdx).join("\n").trim();
-      // Also include the inline value after **Label:**
-      const inlineMatch = lines[startIdx]?.match(regex);
-      const inline = inlineMatch ? lines[startIdx].replace(regex, "").trim() : "";
+      const inline = lines[startIdx]?.replace(regex, "").trim() || "";
       return inline ? inline + "\n" + section : section;
     };
 
-    // Extract sources (tweet links)
+    // Extract sources — handle multiple markdown link formats
     const sources: Source[] = [];
-    const urlRegex = /[-*]\s*(https?:\/\/x\.com\/i\/status\/\S+)\s*[—-]\s*(.*)/g;
+    const seenUrls = new Set<string>();
+
+    // Format: - [text](url) — description
+    const mdLinkRegex = /[-*]\s*\[([^\]]*)\]\((https?:\/\/x\.com\/i\/status\/\d+)\)\s*[—-]\s*(.*)/g;
     let match;
-    while ((match = urlRegex.exec(block)) !== null) {
-      sources.push({ url: match[1], description: match[2].trim() });
+    while ((match = mdLinkRegex.exec(block)) !== null) {
+      if (!seenUrls.has(match[2])) {
+        seenUrls.add(match[2]);
+        sources.push({ url: match[2], description: match[3].trim() });
+      }
     }
-    // Fallback: find any x.com links
+
+    // Format: - url — description
     if (sources.length === 0) {
-      const tweetRegex = /(https:\/\/x\.com\/i\/status\/\d+)/g;
-      let tm;
-      while ((tm = tweetRegex.exec(block)) !== null) {
-        const idx = block.indexOf(tm[1]);
-        const lineStart = block.lastIndexOf("\n", idx) + 1;
-        const lineEnd = block.indexOf("\n", idx);
-        const line = block.slice(lineStart, lineEnd === -1 ? undefined : lineEnd)
-          .replace(tm[1], "").replace(/^[-*\s]+/, "").trim();
-        sources.push({ url: tm[1], description: line || "Tweet source" });
+      const plainUrlRegex = /[-*]\s*(https?:\/\/x\.com\/i\/status\/\S+)\s*[—-]\s*(.*)/g;
+      while ((match = plainUrlRegex.exec(block)) !== null) {
+        const url = match[1].replace(/[)\]]+$/, ""); // strip trailing ) or ]
+        if (!seenUrls.has(url)) {
+          seenUrls.add(url);
+          sources.push({ url, description: match[2].trim() });
+        }
+      }
+    }
+
+    // Fallback: find any x.com links in []() format
+    if (sources.length === 0) {
+      const anyMdLink = /\[([^\]]*)\]\((https:\/\/x\.com\/i\/status\/\d+)\)/g;
+      while ((match = anyMdLink.exec(block)) !== null) {
+        if (!seenUrls.has(match[2])) {
+          seenUrls.add(match[2]);
+          // Get the rest of the line as description
+          const idx = block.indexOf(match[0]);
+          const lineEnd = block.indexOf("\n", idx);
+          const after = block.slice(idx + match[0].length, lineEnd === -1 ? undefined : lineEnd)
+            .replace(/^[\s—-]+/, "").trim();
+          sources.push({ url: match[2], description: after || match[1] || "Tweet source" });
+        }
+      }
+    }
+
+    // Last resort: bare URLs
+    if (sources.length === 0) {
+      const bareRegex = /(https:\/\/x\.com\/i\/status\/\d+)/g;
+      while ((match = bareRegex.exec(block)) !== null) {
+        if (!seenUrls.has(match[1])) {
+          seenUrls.add(match[1]);
+          const idx = block.indexOf(match[1]);
+          const lineStart = block.lastIndexOf("\n", idx) + 1;
+          const lineEnd = block.indexOf("\n", idx);
+          const line = block.slice(lineStart, lineEnd === -1 ? undefined : lineEnd)
+            .replace(match[1], "").replace(/[\[\]()]/g, "").replace(/^[-*\s]+/, "").trim();
+          sources.push({ url: match[1], description: line || "Tweet source" });
+        }
       }
     }
 

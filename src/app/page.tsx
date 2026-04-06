@@ -28,7 +28,10 @@ function clean(text: string): string {
     .replace(/`(.*?)`/g, "$1")
     .replace(/^[-*]\s+/gm, "")
     .replace(/^#+\s+/gm, "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]*)\]\(https?:\/\/[^)]+\)/g, "$1")  // [text](url) → text, [](url) → ""
+    .replace(/\(\s*\)/g, "")  // remove empty ()
+    .replace(/\[\s*\]/g, "")  // remove empty []
+    .replace(/\s{2,}/g, " ")  // collapse multiple spaces
     .trim();
 }
 

@@ -89,24 +89,51 @@ export async function POST() {
 function parseIdeasFromResponse(response: string): Idea[] {
   const ideas: Idea[] = [];
 
-  // Split by "## Idea" headers
-  const ideaBlocks = response.split(/##\s+Idea\s+\d+:\s*/i).filter((b) => b.trim());
+  // Extract idea blocks WITH their titles using a capture group
+  // Each entry: [title, body]
+  const headerRegex = /##\s+Idea\s+\d+:\s*([^\n]+)\n([\s\S]*?)(?=##\s+Idea\s+\d+:|$)/gi;
+  const rawBlocks: { title: string; body: string }[] = [];
+  let m;
+  while ((m = headerRegex.exec(response)) !== null) {
+    rawBlocks.push({ title: m[1].trim(), body: m[2] });
+  }
 
-  // Filter out blocks that don't look like ideas (e.g. "All 8 searches done...")
-  const validBlocks = ideaBlocks.filter((b) => {
-    const firstLine = b.split("\n")[0]?.trim() || "";
-    // Skip meta-output lines
-    if (firstLine.toLowerCase().includes("searches done")) return false;
-    if (firstLine.toLowerCase().includes("ideas generated")) return false;
-    if (firstLine.toLowerCase().includes("here's the")) return false;
-    if (firstLine.toLowerCase().includes("full output")) return false;
-    // Must have some substance
-    return b.length > 100;
+  // Fallback: old split method if regex finds nothing
+  if (rawBlocks.length === 0) {
+    const parts = response.split(/##\s+Idea\s+\d+:\s*/i).filter((b) => b.trim());
+    for (const p of parts) {
+      const lines = p.split("\n");
+      rawBlocks.push({ title: lines[0]?.trim() || "", body: lines.slice(1).join("\n") });
+    }
+  }
+
+  // A valid idea name: not a sentence (no mid-text period + verb), not an agent status phrase
+  const isValidName = (t: string) => {
+    if (!t || t.length < 3) return false;
+    const tl = t.toLowerCase();
+    if (tl.includes("searches done")) return false;
+    if (tl.includes("ideas generated")) return false;
+    if (tl.includes("here's the")) return false;
+    if (tl.includes("full output")) return false;
+    if (tl.includes("skill")) return false;
+    if (tl.includes("loading")) return false;
+    if (tl.includes("memory noted")) return false;
+    if (tl.includes("match found")) return false;
+    // Sentences have a mid-text period followed by a space+capital — product names don't
+    if (/\.\s+[A-Z]/.test(t)) return false;
+    return true;
+  };
+
+  const validBlocks = rawBlocks.filter(({ title, body }) => {
+    if (!isValidName(title)) return false;
+    if (body.length < 100) return false;
+    // Must contain at least one structured idea field
+    return /\*\*(what'?s? trending|the gap|the gitclaw agent|mvp|why it'?ll|sources?):?\*\*/i.test(body);
   });
 
-  for (const block of validBlocks.slice(0, 3)) {
+  for (const { title, body: block } of validBlocks.slice(0, 3)) {
     const lines = block.split("\n");
-    const name = lines[0]?.replace(/^#+\s*/, "").replace(/\s*—.*$/, "").trim() || "Unnamed Idea";
+    const name = title.replace(/\s*—.*$/, "").trim() || "Unnamed Idea";
 
     const getField = (label: string): string => {
       const regex = new RegExp(`\\*\\*${label}:?\\*\\*\\s*(.*)`, "i");

@@ -1,0 +1,14 @@
+spec_version: "0.1.0"
+name: open-source-idea-agent
+version: 1.0.0
+description: Scouts trending tech from Twitter, Hacker News, and GitHub Trending, then generates open-source project ideas you can actually build
+model:
+  preferred: "anthropic:claude-sonnet-4-6"
+  fallback: ["openai:gpt-4o"]
+tools: [cli, read, write, memory]
+skills:
+  - skills/scout
+  - skills/ideate
+  - skills/evaluate
+runtime:
+  max_turns: 50

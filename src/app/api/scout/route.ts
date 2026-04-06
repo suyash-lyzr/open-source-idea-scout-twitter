@@ -1,16 +1,23 @@
 import { NextResponse } from "next/server";
-import { exec } from "child_process";
-import { readdir, readFile, writeFile, mkdir } from "fs/promises";
-import path from "path";
-import { promisify } from "util";
 
-const execAsync = promisify(exec);
+export const maxDuration = 120;
 
-export const maxDuration = 300;
+const TWITTER_BEARER = process.env.TWITTER_BEARER_TOKEN || "";
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
 
-const AGENT_DIR = path.join(process.cwd(), "agent");
+// In-memory session store
+const sessionStore: Session[] = [];
 
 // ── Types ───────────────────────────────────────────────────────
+
+interface Tweet {
+  id: string; text: string; author_id: string; created_at: string;
+  public_metrics: {
+    retweet_count: number; reply_count: number; like_count: number;
+    quote_count: number; bookmark_count: number; impression_count: number;
+  };
+  category: string; engagement: number; link: string;
+}
 
 interface Source { url: string; description: string }
 interface Idea {
@@ -21,211 +28,186 @@ interface Idea {
   rawContent: string;
   marketCheck: { exists: boolean; competitors: { name: string; url: string; snippet: string }[]; verdict: string };
 }
-interface Session {
-  name: string; date: string; time: string; ideas: Idea[];
+interface Session { name: string; date: string; time: string; ideas: Idea[] }
+
+// ── Twitter Searches ────────────────────────────────────────────
+
+const SEARCHES = [
+  { query: '%22someone%20should%20build%22%20-is:retweet', category: 'Wishlist' },
+  { query: '%22I%20wish%20there%20was%22%20-is:retweet', category: 'Pain Point' },
+  { query: '%22open%20source%20alternative%22%20-is:retweet', category: 'OSS Demand' },
+  { query: '(%22just%20shipped%22%20OR%20%22just%20launched%22)%20(AI%20agent%20OR%20developer%20tool)%20-is:retweet', category: 'New Launch' },
+  { query: '(AI%20agent%20OR%20coding%20agent)%20(idea%20OR%20build%20OR%20need%20OR%20missing)%20-is:retweet', category: 'Agent Trend' },
+  { query: '(from:karpathy%20OR%20from:levelsio%20OR%20from:swyx)%20(agent%20OR%20AI%20OR%20build%20OR%20open%20source)%20-is:retweet', category: 'Influencer' },
+  { query: '%22why%20is%20there%20no%22%20(tool%20OR%20app%20OR%20agent)%20-is:retweet', category: 'Unmet Need' },
+  { query: '(%22so%20frustrating%22%20OR%20%22waste%20of%20time%22)%20(developer%20OR%20coding%20OR%20AI)%20-is:retweet', category: 'Frustration' },
+];
+
+async function searchTwitter(query: string, category: string): Promise<Tweet[]> {
+  try {
+    const url = `https://api.twitter.com/2/tweets/search/recent?query=${query}&max_results=10&tweet.fields=public_metrics,author_id,created_at`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${TWITTER_BEARER}` } });
+    const data = await res.json();
+    if (!data.data) return [];
+
+    return data.data.map((t: Record<string, unknown>) => {
+      const metrics = t.public_metrics as Tweet["public_metrics"];
+      const engagement =
+        (metrics?.like_count || 0) * 3 + (metrics?.retweet_count || 0) * 5 +
+        (metrics?.bookmark_count || 0) * 4 + (metrics?.reply_count || 0) * 2 +
+        (metrics?.quote_count || 0) * 3;
+      return {
+        id: t.id, text: t.text, author_id: t.author_id, created_at: t.created_at,
+        public_metrics: metrics, category, engagement,
+        link: `https://x.com/i/status/${t.id}`,
+      };
+    });
+  } catch { return []; }
 }
 
-// ── GET — return existing sessions ──────────────────────────────
+// ── Claude Analysis (Anthropic API) ─────────────────────────────
+
+async function analyzeWithClaude(tweets: Tweet[]): Promise<string> {
+  const tweetData = tweets.map((t) => {
+    const m = t.public_metrics;
+    return `[${t.category}] ${t.text}
+  Link: ${t.link}
+  Metrics: ${m?.like_count || 0} likes, ${m?.retweet_count || 0} RTs, ${m?.bookmark_count || 0} bookmarks, ${m?.impression_count || 0} impressions
+  Engagement score: ${t.engagement}`;
+  }).join("\n\n");
+
+  const systemPrompt = `You are IdeaScout — an agent that analyzes Twitter/X trends and generates the top 3 open-source GitClaw/GitAgent agent ideas.
+
+## What is GitAgent/GitClaw
+- GitAgent = open spec for defining AI agents as folders of markdown files (SOUL.md + agent.yaml + skills/ + memory/)
+- GitClaw = runtime that executes GitAgent agents (CLI, SDK, Voice UI)
+- Agents can use: CLI tools, file read/write, memory, Composio integrations (500+ apps)
+- Agents are portable — export to Claude Code, Cursor, Windsurf, etc.
+
+## Types of ideas to look for
+1. Closed-source tools that should be open-source agents
+2. Ideas from tech influencers (Karpathy, Levelsio, swyx, etc.)
+3. Trending workflows that should be automated
+4. Gaps in the AI agent ecosystem
+5. Viral complaints/wishlists — "someone should build X" tweets
+
+## Output format — respond with EXACTLY this JSON structure:
+{
+  "ideas": [
+    {
+      "name": "AgentName",
+      "pitch": "2-3 sentence description of what this agent does",
+      "trend": "What's trending and why this matters",
+      "sources": [
+        { "url": "https://x.com/i/status/...", "description": "tweet text (likes, bookmarks, impressions)" }
+      ],
+      "gap": "What problem this solves — why no good agent/tool exists for this",
+      "agentDescription": "Detailed description of what this GitClaw agent would do",
+      "mvp": ["SOUL.md: ...", "Skill 1: ...", "Skill 2: ...", "Key feature 1", "Key feature 2"],
+      "stack": "GitAgent spec + Claude Sonnet 4.6 + relevant integrations",
+      "buildTime": "1-2 weeks",
+      "viralityScore": 4,
+      "whyGitClaw": "Why this is perfect as a GitClaw agent and why it'll get stars"
+    }
+  ]
+}
+
+## Rules
+- Output EXACTLY 3 ideas, ranked by potential (highest first)
+- Every idea MUST have real tweet links from the data provided
+- Every idea MUST be buildable as a GitClaw agent by a single developer in 1-2 weeks
+- viralityScore: 1-5 based on engagement (5 = highest engagement tweets)
+- NEVER fabricate metrics — only use what's in the tweet data
+- NEVER suggest ideas that are just "clone X" — there must be a unique angle
+- Focus on ideas with the highest engagement tweets as signal
+- Respond with ONLY the JSON, no markdown fences, no extra text`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6-20250514",
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [{
+        role: "user",
+        content: `Here are ${tweets.length} viral tweets from 8 different Twitter searches. Analyze them and generate the top 3 GitClaw agent ideas.\n\n${tweetData}`,
+      }],
+    }),
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data.content?.[0]?.text || "";
+}
+
+// ── API Routes ──────────────────────────────────────────────────
 
 export async function GET() {
-  try {
-    const sessions = await loadSessions();
-    return NextResponse.json({ sessions });
-  } catch {
-    return NextResponse.json({ sessions: [] });
-  }
+  return NextResponse.json({ sessions: sessionStore });
 }
-
-// ── POST — run gitclaw scout ────────────────────────────────────
 
 export async function POST() {
   try {
-    const gitclawPath = await findGitclaw();
-
-    // Ensure agent/.env exists with current env vars (Railway sets them in dashboard)
-    await ensureAgentEnv();
-
-    // Ensure ideas/ dir exists
-    await mkdir(path.join(AGENT_DIR, "ideas"), { recursive: true });
-    await mkdir(path.join(AGENT_DIR, "scouted"), { recursive: true });
-
-    await execAsync(
-      `${gitclawPath} --dir "${AGENT_DIR}" "Run the scout skill. Deep-scan Twitter/X right now — run all 8 searches. Find the top 3 open-source GitClaw agent ideas based on what people are tweeting about. Include tweet links and engagement metrics for every idea. Follow the SOUL.md output format exactly. Save results to the ideas/ folder."`,
-      {
-        timeout: 280000,
-        maxBuffer: 1024 * 1024 * 10,
-        env: {
-          ...process.env,
-          HOME: process.env.HOME || "/root",
-          PATH: `${process.env.HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`,
-        },
-        cwd: AGENT_DIR,
-      }
+    // Step 1: Fetch tweets from all 8 searches in parallel
+    const allResults = await Promise.all(
+      SEARCHES.map((s) => searchTwitter(s.query, s.category))
     );
 
-    const sessions = await loadSessions();
-    return NextResponse.json({
-      ideas: sessions[0]?.ideas || [],
-      session: sessions[0]?.name || "live",
-      sessions,
-    });
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    console.error("Scout error:", message);
-    return NextResponse.json({ error: `Scout failed: ${message}` }, { status: 500 });
-  }
-}
+    const allTweets = allResults.flat()
+      .filter((t) => {
+        const m = t.public_metrics;
+        return (m?.like_count || 0) >= 5 || (m?.impression_count || 0) >= 500;
+      })
+      .filter((t, i, arr) => arr.findIndex((x) => x.id === t.id) === i)
+      .sort((a, b) => b.engagement - a.engagement)
+      .slice(0, 40); // Send top 40 tweets to Claude
 
-// ── Helpers ─────────────────────────────────────────────────────
+    if (allTweets.length === 0) {
+      return NextResponse.json({ error: "No viral tweets found. Twitter API may be rate-limited." }, { status: 500 });
+    }
 
-async function ensureAgentEnv() {
-  const envVars = [
-    "ANTHROPIC_API_KEY",
-    "TWITTER_BEARER_TOKEN",
-    "TAVILY_API_KEY",
-    "COMPOSIO_API_KEY",
-    "COMPOSIO_USER_ID",
-    "OPENAI_API_KEY",
-  ];
-  const envContent = envVars
-    .filter((key) => process.env[key])
-    .map((key) => `${key}=${process.env[key]}`)
-    .join("\n");
+    // Step 2: Send tweets to Claude Sonnet 4.6 for analysis
+    const claudeResponse = await analyzeWithClaude(allTweets);
 
-  if (envContent) {
-    await writeFile(path.join(AGENT_DIR, ".env"), envContent + "\n", "utf-8");
-  }
-}
+    // Step 3: Parse Claude's JSON response
+    let parsed: { ideas: Array<{
+      name: string; pitch: string; trend: string;
+      sources: Source[]; gap: string; agentDescription: string;
+      mvp: string[]; stack: string; buildTime: string;
+      viralityScore: number; whyGitClaw: string;
+    }> };
 
-async function findGitclaw(): Promise<string> {
-  const candidates = [
-    path.join(process.cwd(), "node_modules", ".bin", "gitclaw"),
-    `${process.env.HOME}/.npm-global/bin/gitclaw`,
-    "/usr/local/bin/gitclaw",
-    "gitclaw",
-  ];
-  for (const c of candidates) {
     try {
-      await execAsync(`test -x "${c}" || which "${c}" 2>/dev/null`);
-      return c;
-    } catch { /* try next */ }
-  }
-  return candidates[0]; // fallback to node_modules
-}
-
-async function loadSessions(): Promise<Session[]> {
-  const sessions: Session[] = [];
-  try {
-    const ideasDir = path.join(AGENT_DIR, "ideas");
-    const entries = await readdir(ideasDir, { withFileTypes: true });
-    const sessionDirs = entries
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name)
-      .sort()
-      .reverse();
-
-    for (const dirName of sessionDirs) {
-      const sessionPath = path.join(ideasDir, dirName);
-      const files = await readdir(sessionPath);
-      const ideaFiles = files.filter(
-        (f) => f.endsWith(".md") && f !== "index.md" && !f.includes("research") && !f.includes("trends")
-      );
-
-      const ideas: Idea[] = await Promise.all(
-        ideaFiles.map(async (file) => {
-          const content = await readFile(path.join(sessionPath, file), "utf-8");
-          return parseIdeaFile(content, file);
-        })
-      );
-
-      ideas.sort((a, b) => b.viralityScore - a.viralityScore);
-
-      const parts = dirName.split("_");
-      sessions.push({
-        name: dirName,
-        date: parts[0] || dirName,
-        time: parts[1]?.replace("-", ":") || "",
-        ideas,
-      });
+      // Strip markdown fences if present
+      const jsonStr = claudeResponse.replace(/^```json?\n?/m, "").replace(/\n?```$/m, "").trim();
+      parsed = JSON.parse(jsonStr);
+    } catch {
+      console.error("Failed to parse Claude response:", claudeResponse.slice(0, 500));
+      return NextResponse.json({ error: "Failed to parse AI response. Please try again." }, { status: 500 });
     }
-  } catch {
-    // ideas/ dir may not exist yet
-  }
-  return sessions;
-}
 
-function parseIdeaFile(content: string, fileName: string): Idea {
-  const lines = content.split("\n");
-  const name = (lines[0] || "").replace(/^#\s+/, "").replace(/\s*—.*$/, "").trim() || fileName.replace(".md", "");
-
-  const getSection = (heading: string): string => {
-    const regex = new RegExp(`##\\s+${heading}`, "i");
-    const startIdx = lines.findIndex((l) => regex.test(l));
-    if (startIdx === -1) return "";
-    const endIdx = lines.findIndex((l, i) => i > startIdx && /^##\s/.test(l));
-    return lines.slice(startIdx + 1, endIdx === -1 ? undefined : endIdx).join("\n").trim();
-  };
-
-  const trendSection = getSection("What.s trending") || getSection("The Trend") || "";
-  const gapSection = getSection("The Gap") || getSection("The gap") || "";
-  const agentSection = getSection("The GitClaw Agent") || getSection("The agent") || "";
-  const mvpSection = getSection("MVP") || "";
-  const whyGitClaw = getSection("Why it.ll get stars") || getSection("Why") || "";
-
-  // Extract sources (tweet links)
-  const sources: Source[] = [];
-  const urlRegex = /[-*]\s*(https?:\/\/\S+)\s*[—-]\s*(.*)/g;
-  let match;
-  while ((match = urlRegex.exec(content)) !== null) {
-    sources.push({ url: match[1], description: match[2].trim() });
-  }
-  if (sources.length === 0) {
-    const tweetRegex = /(https:\/\/x\.com\/i\/status\/\d+)/g;
-    let tweetMatch;
-    while ((tweetMatch = tweetRegex.exec(content)) !== null) {
-      const idx = content.indexOf(tweetMatch[1]);
-      const lineStart = content.lastIndexOf("\n", idx) + 1;
-      const lineEnd = content.indexOf("\n", idx);
-      const line = content.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).replace(tweetMatch[1], "").replace(/^[-*\s]+/, "").trim();
-      sources.push({ url: tweetMatch[1], description: line || "Tweet source" });
-    }
-  }
-
-  const mvpItems: string[] = [];
-  for (const line of mvpSection.split("\n")) {
-    const item = line.replace(/^[-*\s\[\]x]+/, "").trim();
-    if (item && !item.startsWith("#")) mvpItems.push(item);
-  }
-
-  let viralityScore = 3;
-  const numbers = content.match(/(\d{1,3}(?:,\d{3})*)\s*(?:stars?|points?|pts|likes?|impressions?|bookmarks?)/gi) || [];
-  const maxEngagement = Math.max(...numbers.map((n) => parseInt(n.replace(/[^\d]/g, "")) || 0), 0);
-  if (maxEngagement > 10000) viralityScore = 5;
-  else if (maxEngagement > 1000) viralityScore = 4;
-  else if (maxEngagement > 500) viralityScore = 4;
-  else if (maxEngagement > 100) viralityScore = 3;
-
-  const agentFirstPara = agentSection.split("\n").filter((l) => l.trim() && !l.startsWith("#")).slice(0, 2).join(" ").replace(/\*\*(.*?)\*\*/g, "$1").replace(/`(.*?)`/g, "$1").trim();
-  const gapFirstPara = gapSection.split("\n").filter((l) => l.trim() && !l.match(/^\d+\./)).slice(0, 2).join(" ").replace(/\*\*(.*?)\*\*/g, "$1").replace(/`(.*?)`/g, "$1").trim();
-  const pitch = agentFirstPara || gapFirstPara || name;
-
-  const stackMatch = content.match(/\*\*Stack:?\*\*\s*(.*)/i) || content.match(/##\s+Stack\s*\n(.*)/i);
-  const stack = stackMatch ? stackMatch[1].trim() : "GitAgent spec + Claude Sonnet 4.6 + Composio";
-
-  const claudeMd = `# ${name}
+    // Step 4: Build Idea objects
+    const ideas: Idea[] = (parsed.ideas || []).slice(0, 3).map((idea) => {
+      const fileName = idea.name.toLowerCase().replace(/\s+/g, "-") + ".md";
+      const claudeMd = `# ${idea.name}
 
 ## Identity
-You are building "${name}" — a GitClaw/GitAgent-based open-source agent.
+You are building "${idea.name}" — a GitClaw/GitAgent-based open-source agent.
 
 ## What this agent does
-${pitch}
+${idea.pitch}
 
 ## Problem it solves
-${gapSection}
+${idea.gap}
 
 ## Architecture
 \`\`\`
-${name.toLowerCase().replace(/\s+/g, "-")}/
+${idea.name.toLowerCase().replace(/\s+/g, "-")}/
   agent.yaml
   SOUL.md
   RULES.md
@@ -235,7 +217,7 @@ ${name.toLowerCase().replace(/\s+/g, "-")}/
 \`\`\`
 
 ## MVP Scope
-${mvpItems.map((item) => `- ${item}`).join("\n")}
+${idea.mvp.map((item) => `- ${item}`).join("\n")}
 
 ## How to build
 1. Create the folder structure above
@@ -245,12 +227,43 @@ ${mvpItems.map((item) => `- ${item}`).join("\n")}
 5. Test with: \`gitclaw --dir . "test prompt"\`
 `;
 
-  return {
-    name, fileName, pitch,
-    trend: trendSection, sources, gap: gapSection,
-    agentDescription: agentSection, mvp: mvpItems,
-    stack, buildTime: "1-2 weeks", viralityScore, whyGitClaw,
-    claudeMd, rawContent: content,
-    marketCheck: { exists: false, competitors: [], verdict: "" },
-  };
+      return {
+        name: idea.name,
+        fileName,
+        pitch: idea.pitch,
+        trend: idea.trend,
+        sources: idea.sources || [],
+        gap: idea.gap,
+        agentDescription: idea.agentDescription,
+        mvp: idea.mvp || [],
+        stack: idea.stack || "GitAgent spec + Claude Sonnet 4.6 + Composio",
+        buildTime: idea.buildTime || "1-2 weeks",
+        viralityScore: idea.viralityScore || 3,
+        whyGitClaw: idea.whyGitClaw,
+        claudeMd,
+        rawContent: claudeResponse,
+        marketCheck: { exists: false, competitors: [], verdict: "" },
+      };
+    });
+
+    ideas.sort((a, b) => b.viralityScore - a.viralityScore);
+
+    // Step 5: Save to session store
+    const now = new Date();
+    const session: Session = {
+      name: `${now.toISOString().slice(0, 10)}_${now.toISOString().slice(11, 16).replace(":", "-")}`,
+      date: now.toISOString().slice(0, 10),
+      time: now.toISOString().slice(11, 16),
+      ideas,
+    };
+
+    sessionStore.unshift(session);
+    if (sessionStore.length > 10) sessionStore.pop();
+
+    return NextResponse.json({ ideas, session: session.name, sessions: sessionStore });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("Scout error:", message);
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 }

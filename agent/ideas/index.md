@@ -14,6 +14,12 @@
 | S5 | 2026-04-06 | 🥇 | PersonaWiki | @karpathy 808K impressions on personal wiki |
 | S5 | 2026-04-06 | 🥈 | DriftCheck v2 | HN #1 (722pts/479cmts): comfortable drift |
 | S5 | 2026-04-06 | 🥉 | DataEscape | HN Top10 (297pts/155cmts): Google Workspace suspension |
-| **S6** | **2026-04-06** | **🥇** | **GovScope** | **@karpathy 619K impressions: AI government accountability** |
-| **S6** | **2026-04-06** | **🥈** | **AgentWatch** | **Vorim AI: "2 days to find rogue agent" + RetainDB launch** |
-| **S6** | **2026-04-06** | **🥉** | **ReadAgent** | **@karpathy 984 likes: agent as epub/doc converter** |
+| S6 | 2026-04-06 | 🥇 | GovScope | @karpathy 619K impressions: AI government accountability |
+| S6 | 2026-04-06 | 🥈 | AgentWatch | Vorim AI: "2 days to find rogue agent" + RetainDB launch |
+| S6 | 2026-04-06 | 🥉 | ReadAgent | @karpathy 984 likes: agent as epub/doc converter |
+| S7 | 2026-04-07 | 🥇 | KnowledgeGraph Agent | Graphify viral: 198K impressions, 8,140 bookmarks — Karpathy LLM Knowledge Bases |
+| S7 | 2026-04-07 | 🥈 | DisputeBot Agent | @levelsio live-built Stripe auto-dispute system: 164K impressions, 926 bookmarks |
+| S7 | 2026-04-07 | 🥉 | AgentBench Agent | Worldline closed-source launch: teams choose AI coding agents by gut feel |
+| **S8** | **2026-04-07** | **🥇** | **DocIngester Agent** | **@karpathy epub→agent tweet (50K impressions, 1,008 likes) + 1M-impression Farzapedia thread** |
+| **S8** | **2026-04-07** | **🥈** | **AgentGuard Agent** | **"Constraints must live outside the model" — fresh agent permission pain signal** |
+| **S8** | **2026-04-07** | **🥉** | **DisputeBot v2** | **@levelsio auto-dispute (167K impressions, 931 bookmarks) — OSS implementation** |

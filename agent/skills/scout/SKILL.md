@@ -2,8 +2,8 @@
 name: scout
 description: Deep-scan Twitter/X for trending tech ideas and generate top 3 GitClaw agent ideas. Use when the user asks to scout, find trends, or see what's hot.
 confidence: 1
-usage_count: 4
-success_count: 4
+usage_count: 6
+success_count: 6
 failure_count: 0
 negative_examples: []
 ---
